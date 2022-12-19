@@ -1,0 +1,417 @@
+import sys
+import gc
+import time
+import shutil
+import argparse
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+import pickle
+from scipy import sparse
+# from anndata import AnnData
+# import scanpy as sc
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from sklearn.utils import shuffle
+from sklearn.metrics import roc_auc_score, roc_curve
+
+import random
+from meters import AverageMeter
+from logger import WandbLogger
+
+from model import CytoSetModel
+from model import Config, count_params
+from data import CytoDatasetFromFCS
+from utils import (
+    EarlyStopping, load_fcs_dataset, train_valid_split, combine_samples, down_rsampling
+)
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def test_valid(test_loader, model, args):
+    """ Test the model performance """
+    model.eval()
+    losses = AverageMeter(round=3)
+    correct_num, total_num = 0, 0
+    y_pred, y_true = [], []
+
+    for x, y in test_loader:
+        x, y = x.to(args.device), y.to(args.device)
+        with torch.no_grad():
+            prob = model(x)
+            loss = F.binary_cross_entropy(prob, y, reduction='mean')
+            pred_label = torch.ge(prob, 0.5)
+        losses.update(loss.item(), n=x.size(0))
+        v = (pred_label == y).sum()
+
+        y_true.append(y.detach().cpu().numpy())
+        y_pred.append(prob.detach().cpu().numpy())
+
+        correct_num += v.item()
+        total_num += x.size(0)
+
+    acc = float(correct_num) / total_num
+
+    y_true, y_pred = np.hstack(y_true), np.hstack(y_pred)
+    auc = roc_auc_score(y_true, y_pred)
+
+    return acc, losses.avg, auc
+
+
+def test_model(test_samples, test_phenotypes, model, device):
+    model.eval()
+    correct_num, total_num = 0, 0
+    y_pred, y_true = [], []
+    losses = []
+
+    for sample, label in zip(test_samples, test_phenotypes):
+        with torch.no_grad():
+            sample = torch.from_numpy(sample).to(device)
+            true_label = torch.tensor([label], dtype=torch.float32).to(device)
+            prob = model(sample)
+            loss = F.binary_cross_entropy(prob, true_label, reduction='mean')
+            pred_label = torch.ge(prob, 0.5)
+
+        losses.append(loss.item())
+        v = (pred_label == label).sum()
+
+        y_true.append(label)
+        y_pred.append(prob.detach().cpu().numpy())
+
+        correct_num += v.item()
+        total_num += 1
+
+    acc = float(correct_num) / total_num
+
+    y_true, y_pred = np.array(y_true), np.hstack(y_pred)
+    fpr, tpr, _ = roc_curve(y_true, y_pred, pos_label=1)
+    auc = roc_auc_score(y_true, y_pred)
+    eval_loss = np.mean(np.array(losses))
+
+    return eval_loss, acc, auc, fpr, tpr
+
+
+def train(args):
+    set_seed(args.seed)
+
+    logger = WandbLogger(
+        logger_name=f'CytoSet-{args.ncell}@{args.pool}',
+        log_dir=args.log_dir,
+        stream=sys.stdout,
+        args=args,
+        wandb_project='CytoSet'
+    )
+
+    # set model
+    model = CytoSetModel(args).to(args.device)
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
+
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.wts_decay
+    )
+
+    if args.ckpt is not None:
+        print(f'Loading model from {args.ckpt}')
+        checkpoint = torch.load(args.ckpt, map_location='cpu' if not torch.cuda.is_available() else None)
+
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optim'])
+
+    assert args.cell_counts
+    assert args.cell_annotation
+    assert args.sample_metadata
+
+    phenotype_lookup = {}
+    for _, row in pd.read_csv(args.sample_metadata, sep='\t').iterrows():
+        name = row['Sample name']
+        assert name not in phenotype_lookup
+        severity = row['characteristics: CoVID-19 severity']
+        if severity == 'severe/critical':
+            phenotype_lookup[name] = 1
+        if severity == 'mild/moderate':
+            phenotype_lookup[name] = 0
+        # discard other samples
+
+    cell_counts = sparse.load_npz(args.cell_counts).transpose()
+    cell_annotation = pd.read_csv(args.cell_annotation)
+    print('Cell counts', cell_counts.shape, 'Annotation', cell_annotation.shape)
+    assert cell_counts.shape[0] == cell_annotation.shape[0]
+    
+    one_hot_major_type = pd.get_dummies(cell_annotation['majorType']).to_numpy()
+
+    if args.refine:
+        sample_dict = {name: np.empty((0, cell_counts.shape[1] + one_hot_major_type.shape[1])) for name in phenotype_lookup}
+    else:
+        sample_dict = {name: np.empty((0, cell_counts.shape[1])) for name in phenotype_lookup}
+
+    # for cell_count, (_, annotation_row) in tqdm(zip(cell_counts, cell_annotation.iterrows()), total=cell_counts.shape[0]):
+    #     sample_id = annotation_row['sampleID']
+    #     if sample_id not in phenotype_lookup:
+    #         continue
+    #     sample_dict[sample_id].append(cell_count)
+    span_end = 0
+    while span_end != cell_annotation.shape[0]:
+        span_name = cell_annotation.loc[[span_end]]['sampleID'][span_end]
+        span_start = span_end
+        cell_anno = cell_annotation[span_end:]
+        span_end = cell_anno.index[cell_anno['sampleID'] != span_name].to_list()
+        span_end = span_end[0] if span_end else cell_annotation.shape[0]
+        if span_name not in phenotype_lookup:
+            continue
+        print(span_start, span_end, sample_dict[span_name].shape, cell_counts[span_start:span_end, :].shape, end="\r")
+
+        cell_genes = cell_counts[span_start:span_end, :].toarray()
+        cell_kinds = one_hot_major_type[span_start:span_end, :]
+        # print(cell_genes.shape, cell_kinds.shape)
+
+        # cell_genes = sc.pp.normalize_total(AnnData(cell_genes), inplace=False)['X']
+
+        if args.refine:
+            sample_dict[span_name] = np.concatenate((sample_dict[span_name], np.concatenate((cell_genes, cell_kinds), axis=1)))
+        else:
+            sample_dict[span_name] = np.concatenate((sample_dict[span_name], cell_genes))
+
+    samples, phenotypes = [], []
+    for name in phenotype_lookup:
+        # print(name, sample_dict[name].shape)
+        # TODO filter out samples with insufficient cells if necessary
+        samples.append(sample_dict[name])
+        phenotypes.append(phenotype_lookup[name])
+    print()
+    print(f'Collect {len(samples)} samples')
+    samples, phenotypes = shuffle(samples, phenotypes)
+    train_size = int(len(samples) * 0.8)
+    train_samples, train_phenotypes = samples[:train_size], phenotypes[:train_size]
+    test_samples, test_phenotypes = samples[train_size:], phenotypes[train_size:]
+
+    valid_phenotypes = train_phenotypes
+
+    X_train, id_train, X_valid, id_valid = train_valid_split(
+        train_samples, np.arange(len(train_samples))
+    )
+    del train_samples
+    gc.collect()
+
+    X_train, id_train = shuffle(X_train, id_train)
+    train_data = CytoDatasetFromFCS(X_train, id_train, train_phenotypes,
+                                    args.ncell, args.nsubset, args.per_sample)
+    valid_data = CytoDatasetFromFCS(X_valid, id_valid, valid_phenotypes,
+                                    args.ncell, args.nsubset, args.per_sample)
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=args.shuffle,
+        num_workers=1,
+        drop_last=True,
+        pin_memory=False
+    )
+
+    valid_loader = DataLoader(
+        valid_data,
+        batch_size=args.batch_size,
+        num_workers=1,
+        pin_memory=False,
+        drop_last=False
+    )
+
+    logger.info('**** Start Training ****')
+    logger.info(f' config: {args.ncell}@{args.pool}')
+    logger.info(f' Total epochs: {args.n_epochs}')
+    logger.info('Total Params: {:.2f}M'.format(count_params(model) / 1e6))
+
+    losses = AverageMeter(round=3)
+    data_time = AverageMeter(round=3)
+    step_time = AverageMeter(round=3)
+
+    best_auc = 0
+    pbar = tqdm(range(args.n_epochs), initial=0, dynamic_ncols=True, smoothing=0.01)
+
+    # start the main training loop
+    for epoch in pbar:
+        model.train()
+
+        # get the data
+        for x, y in train_loader:
+            start_time = time.time()
+            x, y = x.to(args.device), y.to(args.device)
+            # count data moving time
+            data_time.update(time.time() - start_time)
+
+            # model feed forward
+            prob = model(x)
+            loss = F.binary_cross_entropy(prob, y, reduction='mean')
+
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            step_time.update(time.time() - start_time)
+            losses.update(loss.item())
+
+        # log the training progress
+        if (epoch + 1) % args.log_interval == 0:
+            val_acc, val_loss, val_auc = test_valid(valid_loader, model, args)
+
+            pbar.set_description(
+                "Epoch: {}/{}, data: {:.3f}, step: {:.3f}, loss: {:.3f}, val_loss: {:.3f}, val_acc: {:.3f}, val_auc: {:.3f}".format(
+                    str(epoch + 1).zfill(4), args.n_epochs, data_time.avg,
+                    step_time.avg, losses.avg, val_loss, val_acc, val_auc
+                )
+            )
+
+            stats = {
+                'epoch': epoch + 1,
+                'loss': losses.avg,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'val_auc': val_auc
+            }
+            logger._log_to_wandb(stats=stats, epoch=epoch + 1)
+
+            # check early stop condition
+            early_stopping(val_loss=val_loss)
+            if early_stopping.early_stop:
+                logger.info(f"Training early stops at epoch: {epoch+1}")
+                break
+
+        losses.reset()
+        data_time.reset()
+        step_time.reset()
+
+        if (epoch + 1) % args.save_interval == 0:
+            val_acc, val_loss, val_auc = test_valid(valid_loader, model, args)
+            is_best = val_auc >= best_auc
+            best_auc = max(best_auc, val_auc)
+
+            ckpt_file = f"{args.log_dir}/{str(epoch + 1).zfill(4)}.ckpt"
+
+            torch.save(
+                {
+                    'model': model.state_dict(),
+                    'optim': optimizer.state_dict(),
+                    'args': args,
+                    'val_acc': val_acc,
+                    'val_auc': val_auc,
+                    'epoch': epoch + 1
+                },
+                ckpt_file
+            )
+            if is_best:
+                # save the best model and check points
+                torch.save(model.state_dict(), f'{args.log_dir}/best_model.pt')
+                shutil.copyfile(ckpt_file, f'{args.log_dir}/best.ckpt')
+
+        pbar.update()
+
+    pbar.close()
+    logger.info("**** Training Finished ****")
+
+    # load best model and check the performance on test data
+    # format test samples
+
+    test_samples = [np.expand_dims(sample, 0).astype(np.float32) for sample in test_samples]
+    if args.test_rsampling:
+        test_samples = [down_rsampling(sample, args.ncell, axis=1) for sample in test_samples]
+    state_dict = torch.load(f'{args.log_dir}/best_model.pt', map_location='cpu' if not torch.cuda.is_available() else None)
+    model.load_state_dict(state_dict, strict=True)
+
+    # test model
+    _, test_acc, test_auc, test_fpr, test_tpr = test_model(test_samples, test_phenotypes, model, args.device)
+    logger.info("Testing Acc: {:.3f}, Testing Auc: {:.3f}".format(test_acc, test_auc))
+
+    with open(f'{args.log_dir}/test_result.pkl', 'wb') as f:
+        test_stat = {
+            'test_sample': test_samples,
+            'test_phenotype': test_phenotypes,
+            'fpr': test_fpr,
+            'tpr': test_tpr,
+            'test_acc': test_acc,
+            'test_auc': test_auc
+        }
+        pickle.dump(test_stat, f)
+
+    # Finished the training and testing, saving the configurations
+    logger.info("Testing finished, saving training configurations....")
+    config = Config.from_args(args)
+    config.to_json_file(f"{args.log_dir}/config.json")
+    logger.info("Done")
+
+
+def main():
+    parser = argparse.ArgumentParser("Cytometry Set Model for CoVID-19")
+
+    parser.add_argument('--cell_counts', type=str)
+    parser.add_argument('--cell_annotation', type=str)
+    parser.add_argument('--sample_metadata', type=str)
+    parser.add_argument('--refine', action='store_true')
+
+    # model
+    parser.add_argument('--in_dim', default=37, type=int, help="input dim")
+    parser.add_argument('--h_dim', default=64, type=int, help='hidden dims to use in the model')
+    parser.add_argument('--pool', default='max', choices=['mean', 'max', 'sum'], type=str, help='block pooling type')
+    parser.add_argument('--out_pool', default='mean', choices=['mean', 'max', 'sum'], type=str, help='output pooling type')
+    parser.add_argument('--nblock', default=1, type=int, help="# of blocks to use in the model")
+
+    # optimizer
+    parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
+    parser.add_argument('--beta1', default=0.9, type=float, help='beta_1 params in the optimizer')
+    parser.add_argument('--beta2', default=0.999, type=float, help='beta_2 params in the optimizer')
+    parser.add_argument('--wts_decay', default=1e-3, type=float, help='coefficient of weight decay')
+    parser.add_argument('--patience', default=5, type=int, help='the patience param for early stopping')
+
+    # data
+    parser.add_argument('--train_fcs_info', type=str, default=None, help='path to train fcs info file')
+    parser.add_argument('--valid_fcs_info', default=None, type=str, help='path to valid fcs info file')
+    parser.add_argument('--test_fcs_info', type=str, default=None, help='path to test fcs info file')
+    parser.add_argument('--train_pkl', type=str, default=None, help='path to the training pickle file')
+    parser.add_argument('--valid_pkl', type=str, default=None, help='path to the valid pickle file')
+    parser.add_argument('--test_pkl', type=str, default=None, help='path to the testing pickle file')
+
+    parser.add_argument('--markerfile', type=str, help='path to marker indication file')
+    parser.add_argument('--generate_valid', action='store_true', help='whether to generate valid data from train data')
+    parser.add_argument('--test_rsampling', action='store_true', help='whether to test model using sampled data')
+    parser.add_argument('--pkl', action='store_true', help='load data directly from pickled data')
+
+    parser.add_argument('--batch_size', default=200, type=int, help='batch size of labeled data')
+    parser.add_argument('--nsubset', default=1024, type=int, help='total number of multi-cell inputs that will be generated per class')
+    parser.add_argument('--ncell', default=200, type=int, help='number of cells per multi-cell input')
+    parser.add_argument('--co_factor', default=5, type=float, help='arcsinh normalization factor')
+    parser.add_argument('--per_sample', action='store_true', help='whether the nsubset argument refers to each class or each input')
+
+    parser.add_argument('--shuffle', action='store_true', help='whether to shuffle the data')
+    parser.add_argument('--n_epochs', default=200, type=int, help='number of total training epochs')
+    parser.add_argument('--log_dir', default='./exp', type=str, help='path to log dir')
+    parser.add_argument('--log_interval', default=1, type=int, help='logging interval')
+    parser.add_argument('--save_interval', default=5, type=int, help='save model interval')
+
+    # utils
+    parser.add_argument('--seed', default=12345, type=int, help='random seed to use')
+    parser.add_argument('--device', default='cuda', type=str, help='specify the training device')
+    parser.add_argument('--ckpt', default=None, type=str, help='path to the checkpoint file')
+
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        args.device = 'cpu'
+
+    # train the model
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
