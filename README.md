@@ -9,7 +9,8 @@ $ python ../../../../test.py --model best_model.pt --config_file config.json --t
 ```
 
 To train a new model from GSE158055 dataset
-* Download processed files `counts_marked.npz`, `GSE158055_cell_annotation.csv.gz` (decompress it) and `GSE158055_sample_metadata.tsv`,
+* Download processed files `counts_marked.npz`, `GSE158055_cell_annotation.csv.gz` (decompress it) and `GSE158055_sample_metadata.tsv`
+from [google drive](https://drive.google.com/drive/u/1/folders/1cPf6JRAT6E2hiaOaFTOcizFAP47q-dkl),
 put them under `Data/GSE158055` directory
 * Change to `scripts/train` directory
 * Run `train_GSE158055.sh` or `train_GSE158055_refined.sh` for training baseline and refined model respectively
